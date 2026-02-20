@@ -1,0 +1,8 @@
+# Compiled binaries
+port-gate
+port-gate-amd64
+port-gate-arm64
+port-gate-universal
+
+# User's local configuration
+port-gate.json
