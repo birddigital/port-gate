@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -22,11 +23,19 @@ import (
 const (
 	// Default port for the gate itself
 	DefaultPort = 80
-	// System index config directory
-	SystemIndexDir = "~/.system-index"
 )
 
-// Service represents a service from system-index
+// getDefaultConfigDir returns the default configuration directory (~/.port-gate/)
+func getDefaultConfigDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Printf("[WARN] Cannot determine home directory: %v; using current directory", err)
+		return ".port-gate"
+	}
+	return filepath.Join(home, ".port-gate")
+}
+
+// Service represents a service entry for auto-import
 type Service struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
@@ -49,11 +58,17 @@ type PortGate struct {
 	http        *http.Server
 	mu          sync.RWMutex
 	hostsFile   string
+	autoImport  bool
+	servicesDir string
 }
 
 func main() {
-	configPath := getConfigPath()
-	cfg, err := loadConfig(configPath)
+	configDir := flag.String("config-dir", "", "Configuration directory (overrides PORT_GATE_CONFIG_DIR env var, default: ~/.port-gate/)")
+	autoImport := flag.Bool("auto-import", false, "Auto-import services from the services sub-directory of the config dir")
+	flag.Parse()
+
+	configPath := getConfigPath(*configDir)
+	cfg, err := loadConfig(configPath, *autoImport)
 	if err != nil {
 		log.Printf("[WARN] No config found, creating default: %v", err)
 		cfg = &Config{
@@ -65,12 +80,14 @@ func main() {
 				"X-Real-IP":         "127.0.0.1",
 			},
 		}
-		// Auto-import from system-index
-		importFromSystemIndex(cfg)
+		if *autoImport {
+			servicesDir := filepath.Join(filepath.Dir(configPath), "services")
+			importFromServicesDir(cfg, servicesDir)
+		}
 		saveConfig(configPath, cfg)
 	}
 
-	gate, err := NewPortGate(cfg, configPath)
+	gate, err := NewPortGate(cfg, configPath, *autoImport)
 	if err != nil {
 		log.Fatalf("[FATAL] Failed to create gate: %v", err)
 	}
@@ -88,7 +105,7 @@ func main() {
 }
 
 // NewPortGate creates a new PortGate
-func NewPortGate(cfg *Config, configPath string) (*PortGate, error) {
+func NewPortGate(cfg *Config, configPath string, autoImport bool) (*PortGate, error) {
 	// Default to localhost if binding to port 80 fails without root
 	if cfg.Port == 80 && os.Geteuid() != 0 {
 		log.Println("[WARN] Port 80 requires root. Using 8080 instead.")
@@ -97,9 +114,11 @@ func NewPortGate(cfg *Config, configPath string) (*PortGate, error) {
 
 	mux := http.NewServeMux()
 	gate := &PortGate{
-		config:     cfg,
-		configPath: configPath,
-		hostsFile:  "/etc/hosts",
+		config:      cfg,
+		configPath:  configPath,
+		hostsFile:   "/etc/hosts",
+		autoImport:  autoImport,
+		servicesDir: filepath.Join(filepath.Dir(configPath), "services"),
 	}
 
 	// Register catch-all handler
@@ -145,7 +164,7 @@ func (g *PortGate) handleRequest(w http.ResponseWriter, r *http.Request) {
 	g.mu.RUnlock()
 
 	if !ok {
-		// Try to find by prefix (e.g., "taskflow" matches "taskflow.local")
+		// Try to find by prefix (e.g., "myapp" matches "myapp.local")
 		g.mu.RLock()
 		for domain, port := range g.config.Services {
 			if strings.HasPrefix(host, domain) || strings.HasPrefix(domain, host) {
@@ -212,11 +231,11 @@ func (g *PortGate) watchConfig() {
 	configDir := filepath.Dir(g.configPath)
 	watcher.Add(configDir)
 
-	// Also watch system-index services dir
-	systemIndexDir := expandPath(SystemIndexDir)
-	if _, err := os.Stat(systemIndexDir); err == nil {
-		watcher.Add(systemIndexDir)
-		watcher.Add(filepath.Join(systemIndexDir, "services"))
+	// Also watch services directory if auto-import is enabled
+	if g.autoImport {
+		if _, err := os.Stat(g.servicesDir); err == nil {
+			watcher.Add(g.servicesDir)
+		}
 	}
 
 	for {
@@ -227,11 +246,13 @@ func (g *PortGate) watchConfig() {
 			}
 			if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
 				// Reload config
-				if newCfg, err := loadConfig(g.configPath); err == nil {
+				if newCfg, err := loadConfig(g.configPath, g.autoImport); err == nil {
 					g.mu.Lock()
 					g.config = newCfg
 					g.mu.Unlock()
 					log.Printf("[RELOAD] Configuration reloaded")
+				} else {
+					log.Printf("[WARN] Failed to reload config: %v", err)
 				}
 			}
 		case err, ok := <-watcher.Errors:
@@ -274,18 +295,23 @@ func (g *PortGate) Stop() error {
 }
 
 // getConfigPath returns the config file path
-func getConfigPath() string {
+func getConfigPath(configDir string) string {
 	// Check for config in current directory first
 	if _, err := os.Stat("port-gate.json"); err == nil {
 		return "port-gate.json"
 	}
-	// Then check ~/.system-index/
-	dir := expandPath(SystemIndexDir)
-	return filepath.Join(dir, "port-gate.json")
+	// Use config dir from flag, env var, or default
+	if configDir == "" {
+		configDir = os.Getenv("PORT_GATE_CONFIG_DIR")
+	}
+	if configDir == "" {
+		configDir = getDefaultConfigDir()
+	}
+	return filepath.Join(expandPath(configDir), "port-gate.json")
 }
 
 // loadConfig loads configuration from file
-func loadConfig(path string) (*Config, error) {
+func loadConfig(path string, autoImport bool) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -296,9 +322,10 @@ func loadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 
-	// Auto-import from system-index if services is empty
-	if len(cfg.Services) == 0 {
-		importFromSystemIndex(&cfg)
+	// Auto-import from services directory if enabled and services is empty
+	if autoImport && len(cfg.Services) == 0 {
+		servicesDir := filepath.Join(filepath.Dir(path), "services")
+		importFromServicesDir(&cfg, servicesDir)
 	}
 
 	return &cfg, nil
@@ -313,13 +340,11 @@ func saveConfig(path string, cfg *Config) error {
 	return os.WriteFile(path, data, 0644)
 }
 
-// importFromSystemIndex reads services from system-index configs
-func importFromSystemIndex(cfg *Config) {
-	systemIndexDir := expandPath(SystemIndexDir)
-	servicesDir := filepath.Join(systemIndexDir, "services")
-
+// importFromServicesDir reads service definitions from JSON files in the given directory
+func importFromServicesDir(cfg *Config, servicesDir string) {
 	entries, err := os.ReadDir(servicesDir)
 	if err != nil {
+		log.Printf("[INFO] Auto-import skipped: cannot read services dir %s: %v", servicesDir, err)
 		return
 	}
 

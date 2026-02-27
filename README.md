@@ -3,25 +3,31 @@
 **Local Development Domain Router** - Access your services by name instead of port numbers.
 
 ```
-http://taskflow.local/    → localhost:8081
-http://mcp-hub.local/     → localhost:8084
-http://kekuli.local/      → localhost:3000
+http://myapp.local/      → localhost:3000
+http://api.local/        → localhost:8080
+http://frontend.local/   → localhost:4200
 ```
 
 ## Features
 
 - **No more port numbers** - Access services by domain name
-- **Auto-discovers services** - Reads from `~/.system-index/services/*.json`
-- **Live reload** - Picks up new services automatically
+- **Live reload** - Picks up config changes automatically
 - **Single binary** - Pure Go, no runtime dependencies
-- **Zero config** - Works out of the box with system-index
+- **Flexible config** - Works with a local `port-gate.json` or a configurable config directory
+- **Optional service discovery** - Can auto-import service definitions from a directory (see below)
 
 ## Installation
 
 ```bash
-cd /Users/birddigital/sources/standalone-projects/port-gate
+git clone https://github.com/birddigital/port-gate.git
+cd port-gate
 go build -o port-gate
-ln -s $PWD/port-gate ~/.local/bin/
+
+# Install to user binary directory
+mkdir -p ~/.local/bin
+cp port-gate ~/.local/bin/
+# or system-wide
+sudo cp port-gate /usr/local/bin/
 ```
 
 ## Quick Start
@@ -38,29 +44,41 @@ Add the printed entries to `/etc/hosts`:
 
 ```bash
 # Add these lines to /etc/hosts:
-127.0.0.1  taskflow.local
-127.0.0.1  mcp-hub.local
-127.0.0.1 kekuli.local
+127.0.0.1  myapp.local
+127.0.0.1  api.local
+127.0.0.1  frontend.local
 ```
 
 Then access services:
 ```bash
-open http://taskflow.local/dashboard
-open http://mcp-hub.local/tools
+open http://myapp.local/dashboard
+open http://api.local/health
 ```
 
 ## Configuration
 
-Optional config file at `~/.system-index/port-gate.json`:
+Port-Gate looks for configuration in the following order:
+
+1. `./port-gate.json` (current directory)
+2. `$PORT_GATE_CONFIG_DIR/port-gate.json` (if env var is set)
+3. `~/.port-gate/port-gate.json` (default)
+
+You can also specify the config directory with a flag:
+
+```bash
+port-gate --config-dir /path/to/config
+```
+
+Example `port-gate.json`:
 
 ```json
 {
   "port": 80,
   "domain_suffix": ".local",
   "services": {
-    "taskflow": 8081,
-    "mcp-hub": 8084,
-    "kekuli": 3000
+    "myapp": 3000,
+    "api": 8080,
+    "frontend": 4200
   },
   "headers": {
     "X-Forwarded-Proto": "http",
@@ -69,26 +87,35 @@ Optional config file at `~/.system-index/port-gate.json`:
 }
 ```
 
-If `services` is empty, it auto-imports from system-index service configs.
+See `port-gate.json.example` for a ready-to-use template.
 
-## System Index Integration
+## Optional: Service Auto-Discovery
 
-Port-Gate reads service definitions from:
+Port-Gate can auto-import service definitions from JSON files in a `services/` subdirectory of the config directory. This feature is **disabled by default** and must be explicitly enabled:
 
-```
-~/.system-index/services/
-├── taskflow.json      # {"id": "taskflow-web", "port": 8081, ...}
-├── mcp-hub.json       # {"id": "mcp-hub", "port": 8084, ...}
-└── ...
+```bash
+port-gate --auto-import
 ```
 
-The service `id` becomes the domain name (with `-web` suffix removed).
+When enabled, Port-Gate reads `*.json` files from `<config-dir>/services/` (e.g., `~/.port-gate/services/`). Each file should contain:
+
+```json
+{"id": "myapp", "port": 3000}
+```
+
+The service `id` (or `name` if `id` is empty) becomes the domain name (with `-web` suffix removed).
+
+## Environment Variables
+
+| Variable | Description |
+|---|---|
+| `PORT_GATE_CONFIG_DIR` | Override the configuration directory |
 
 ## Running on Login
 
 ### Using launchd (macOS)
 
-Create `~/Library/LaunchAgents/com.birddigital.port-gate.plist`:
+Create `~/Library/LaunchAgents/local.port-gate.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -96,10 +123,10 @@ Create `~/Library/LaunchAgents/com.birddigital.port-gate.plist`:
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.birddigital.port-gate</string>
+    <string>local.port-gate</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/birddigital/.local/bin/port-gate</string>
+        <string>/usr/local/bin/port-gate</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -111,8 +138,8 @@ Create `~/Library/LaunchAgents/com.birddigital.port-gate.plist`:
 
 Load it:
 ```bash
-launchctl load ~/Library/LaunchAgents/com.birddigital.port-gate.plist
-launchctl start com.birddigital.port-gate
+launchctl load ~/Library/LaunchAgents/local.port-gate.plist
+launchctl start local.port-gate
 ```
 
 ### With sudo (for port 80)
@@ -120,8 +147,8 @@ launchctl start com.birddigital.port-gate
 To bind to port 80, the process needs root. Use `sudo` or configure authless sudo for this specific binary:
 
 ```bash
-# sudoers entry:
-birddigital ALL=(root) NOPASSWD: /Users/birddigital/.local/bin/port-gate
+# sudoers entry (replace 'youruser' with your actual username and adjust the path):
+youruser ALL=(root) NOPASSWD: /usr/local/bin/port-gate
 ```
 
 ## Architecture
@@ -138,8 +165,8 @@ birddigital ALL=(root) NOPASSWD: /Users/birddigital/.local/bin/port-gate
 │                                                           │
 │  request:83.2ms  GET /dashboard                          │
 │       ↓                                                   │
-│  taskflow.local → reverse_proxy → localhost:8081        │
-│  mcp-hub.local → reverse_proxy → localhost:8084         │
+│  myapp.local    → reverse_proxy → localhost:3000        │
+│  api.local      → reverse_proxy → localhost:8080        │
 │                                                           │
 └─────────────────────────────────────────────────────────┘
 ```

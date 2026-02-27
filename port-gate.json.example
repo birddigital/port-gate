@@ -1,0 +1,13 @@
+{
+  "port": 80,
+  "domain_suffix": ".local",
+  "services": {
+    "myapp": 3000,
+    "api": 8080,
+    "frontend": 4200
+  },
+  "headers": {
+    "X-Forwarded-Proto": "http",
+    "X-Real-IP": "127.0.0.1"
+  }
+}
