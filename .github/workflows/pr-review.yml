@@ -1,0 +1,144 @@
+name: PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr diff ${{ github.event.pull_request.number }} > /tmp/pr.diff
+          DIFF_SIZE=$(wc -l < /tmp/pr.diff)
+          echo "lines=$DIFF_SIZE" >> $GITHUB_OUTPUT
+          head -6000 /tmp/pr.diff > /tmp/pr_truncated.diff
+
+      - name: Check for existing review comment
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            --jq '[.[] | select(.body | startswith("## 🤖 AI Review"))] | length')
+          echo "count=$EXISTING" >> $GITHUB_OUTPUT
+
+      - name: Post checklist (no Gemini key)
+        if: steps.check.outputs.count == '0' && env.GEMINI_API_KEY == ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          REPO="${{ github.repository }}"
+          AUTHOR="${{ github.event.pull_request.user.login }}"
+          CHANGED="${{ github.event.pull_request.changed_files }}"
+          ADDITIONS="${{ github.event.pull_request.additions }}"
+          DELETIONS="${{ github.event.pull_request.deletions }}"
+
+          SIZE_BADGE="🟢 Small"
+          if [ "$CHANGED" -gt 20 ]; then SIZE_BADGE="🔴 Large"; elif [ "$CHANGED" -gt 5 ]; then SIZE_BADGE="🟡 Medium"; fi
+
+          BODY="## 🤖 AI Review — ${REPO##*/}
+
+**Author**: @${AUTHOR}
+**Size**: ${SIZE_BADGE} — ${CHANGED} file(s), +${ADDITIONS}/-${DELETIONS}
+
+### Checklist
+- [ ] Tests pass (CI green)
+- [ ] No hardcoded secrets or credentials
+- [ ] Error handling: no bare errors ignored
+- [ ] Parameterized SQL — no string concatenation in queries
+- [ ] No stub implementations (all cases fully implemented)
+- [ ] Security headers / middleware wraps new routes
+- [ ] CSRF token on all POST forms
+
+---
+_Add GEMINI_API_KEY secret for AI-powered review_"
+
+          gh pr comment ${{ github.event.pull_request.number }} --body "$BODY"
+
+      - name: Gemini AI review
+        if: steps.check.outputs.count == '0' && env.GEMINI_API_KEY != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          DIFF=$(cat /tmp/pr_truncated.diff | python3 -c "
+          import sys, json
+          print(json.dumps(sys.stdin.read()))
+          ")
+
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          REPO="${{ github.repository }}"
+
+          PROMPT="You are reviewing a pull request for the ${REPO} repository.
+
+PR title: $PR_TITLE
+
+Review the diff below. Check for:
+1. Correctness — bugs, unhandled error cases, logic errors
+2. Security — parameterized SQL, no secrets committed, auth on new routes
+3. Code quality — error handling, no stub implementations
+4. Performance — N+1 queries, unbounded loops
+
+Be concise. Use P1/P2/P3 labels. P1 = must fix before merge, P2 = should fix, P3 = suggestion.
+If nothing significant to flag, say so briefly.
+
+Diff:
+$DIFF"
+
+          RESPONSE=$(curl -s \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$GEMINI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"contents\": [{
+                \"parts\": [{\"text\": $(echo "$PROMPT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")}]
+              }],
+              \"generationConfig\": {
+                \"temperature\": 0.2,
+                \"maxOutputTokens\": 1500
+              }
+            }")
+
+          REVIEW_TEXT=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          try:
+              print(data['candidates'][0]['content']['parts'][0]['text'])
+          except:
+              print('Review unavailable: ' + json.dumps(data.get('error', data)))
+          ")
+
+          DIFF_LINES=${{ steps.diff.outputs.lines }}
+          TRUNCATED_NOTE=""
+          if [ "$DIFF_LINES" -gt 6000 ]; then
+            TRUNCATED_NOTE="> ⚠️ Diff truncated to 6000 lines (total: $DIFF_LINES)"$'\n\n'
+          fi
+
+          BODY="## 🤖 AI Review — ${REPO##*/}
+_Gemini 1.5 Flash · $(git rev-parse --short HEAD)_
+
+${TRUNCATED_NOTE}${REVIEW_TEXT}
+
+---
+**Standard checklist**
+- [ ] No secrets or credentials committed
+- [ ] Error handling complete
+- [ ] Parameterized SQL only
+- [ ] No stub implementations"
+
+          gh pr comment ${{ github.event.pull_request.number }} --body "$BODY"
